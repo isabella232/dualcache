@@ -20,6 +20,8 @@ import com.jakewharton.disklrucache.DiskLruCache;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
  * This class intent to provide a very easy to use, reliable, highly configurable caching library
@@ -38,7 +40,7 @@ public class DualCache<T> {
     private final int appVersion;
     private final DualCacheRamMode ramMode;
     private final DualCacheDiskMode diskMode;
-    private final CacheSerializer<T> diskSerializer;
+    private final DiskCacheSerializer<T> diskSerializer;
     private final CacheSerializer<T> ramSerializer;
     private final DualCacheLock dualCacheLock = new DualCacheLock();
     private final Logger logger;
@@ -52,7 +54,7 @@ public class DualCache<T> {
         int maxRamSizeBytes,
         SizeOf<T> sizeOf,
         DualCacheDiskMode diskMode,
-        CacheSerializer<T> diskSerializer,
+        DiskCacheSerializer<T> diskSerializer,
         int maxDiskSizeBytes,
         File diskFolder
     ) {
@@ -161,7 +163,8 @@ public class DualCache<T> {
                     // Optimization if using same serializer
                     editor.set(0, ramSerialized);
                 } else {
-                    editor.set(0, diskSerializer.toString(object));
+                    OutputStream out = editor.newOutputStream(0);
+                    diskSerializer.writeToStream(out, object);
                 }
                 editor.commit();
             } catch (IOException e) {
@@ -183,7 +186,7 @@ public class DualCache<T> {
     public T get(String key) {
 
         Object ramResult = null;
-        String diskResult = null;
+        InputStream diskResult = null;
         DiskLruCache.Snapshot snapshotObject = null;
 
         // Try to get the object from RAM.
@@ -208,11 +211,7 @@ public class DualCache<T> {
 
                 if (snapshotObject != null) {
                     loggerHelper.logEntryForKeyIsOnDisk(key);
-                    try {
-                        diskResult = snapshotObject.getString(0);
-                    } catch (IOException e) {
-                        logger.logError(e);
-                    }
+                    diskResult = snapshotObject.getInputStream(0);
                 } else {
                     loggerHelper.logEntryForKeyIsNotOnDisk(key);
                 }
@@ -222,19 +221,25 @@ public class DualCache<T> {
 
             if (diskResult != null) {
                 // Load object, no need to check disk configuration since diskresult != null.
-                objectFromStringDisk = diskSerializer.fromString(diskResult);
+                try {
+                    objectFromStringDisk = diskSerializer.fromStream(diskResult);
 
-                // Refresh object in ram.
-                if (ramMode.equals(DualCacheRamMode.ENABLE_WITH_REFERENCE)) {
-                    if (diskMode.equals(DualCacheDiskMode.ENABLE_WITH_SPECIFIC_SERIALIZER)) {
-                        ramCacheLru.put(key, objectFromStringDisk);
+                    // Refresh object in ram.
+                    if (ramMode.equals(DualCacheRamMode.ENABLE_WITH_REFERENCE)) {
+                        if (diskMode.equals(DualCacheDiskMode.ENABLE_WITH_SPECIFIC_SERIALIZER)) {
+                            ramCacheLru.put(key, objectFromStringDisk);
+                        }
+                    } else if (ramMode.equals(DualCacheRamMode.ENABLE_WITH_SPECIFIC_SERIALIZER)) {
+                        if (diskSerializer == ramSerializer) {
+                            ramCacheLru.put(key, diskResult);
+                        } else {
+                            ramCacheLru.put(key, ramSerializer.toString(objectFromStringDisk));
+                        }
                     }
-                } else if (ramMode.equals(DualCacheRamMode.ENABLE_WITH_SPECIFIC_SERIALIZER)) {
-                    if (diskSerializer == ramSerializer) {
-                        ramCacheLru.put(key, diskResult);
-                    } else {
-                        ramCacheLru.put(key, ramSerializer.toString(objectFromStringDisk));
-                    }
+                } catch (IOException e) {
+                    logger.logError(e);
+                } finally {
+                    Util.closeQuietly(diskResult);
                 }
                 return objectFromStringDisk;
             }
